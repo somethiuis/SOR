@@ -1,0 +1,1700 @@
+/**
+ * School of Rock Springfield - Email conversation agent
+ *
+ * Email 1 is parsed and templated with no AI at all. Everything the opener
+ * needs is already in the HubSpot notification, so there is nothing for a
+ * model to add except drift.
+ *
+ * The model only writes from email 2 onward, where it has to react to
+ * something a real person typed.
+ *
+ * SETUP (once):
+ *   1. Project Settings > Script Properties:
+ *        ANTHROPIC_API_KEY = sk-ant-...
+ *   2. Run setupLabels()
+ *   3. Gmail filter: subject contains "New Lead - Contact" -> apply NewLead
+ *   4. Trigger run() every minute
+ */
+
+var MODEL     = 'claude-sonnet-5';
+var MAX_TURNS = 8;
+
+var CALENDAR_ID  = 'primary';   // swap for the school calendar
+var CALL_MINUTES = 15;
+var TIMEZONE     = 'America/New_York';
+
+var SCHOOL_DOMAIN = 'schoolofrock.com';
+var ADULT_AGE     = 18;
+var LITTLE_AGE    = 6;          // below this, "getting into it" reads wrong
+
+var L_NEW     = 'NewLead';
+var L_DONE    = 'Processed';
+var L_THREAD  = 'SoRLead';
+var L_BOOKED  = 'SoRBooked';
+var L_HANDOFF = 'SoRHandoff';
+var L_ERROR   = 'SoRError';
+
+
+var SIGNATURE = [
+  '',
+  '',
+  'Best,',
+  'Laurie',
+  'School of Rock Springfield, VA',
+  '(703) 755-7276'
+].join('\n');
+
+// Kept in case Ethan says it is required. Not currently sent: on a four line
+// email it was three times longer than the message.
+var LEGAL = [
+  '',
+  '',
+  'This email and any files transmitted with it are confidential and intended ' +
+  'solely for the use of the individual or entity to whom they are addressed. ' +
+  'If you have received this email in error please notify the system manager. ' +
+  'This message contains confidential information and is intended only for the ' +
+  'individual named. If you are not the named addressee you should not ' +
+  'disseminate, distribute or copy this e-mail. Please notify the sender ' +
+  'immediately by e-mail if you have received this e-mail by mistake and delete ' +
+  'this e-mail from your system. If you are not the intended recipient you are ' +
+  'notified that disclosing, copying, distributing or taking any action in ' +
+  'reliance on the contents of this information is strictly prohibited.'
+].join('\n');
+
+
+/* ------------------------------------------------------------------ *
+ * SYSTEM PROMPT - only used from email 2 onward
+ * ------------------------------------------------------------------ */
+
+var SYSTEM_PROMPT = [
+'You are Laurie, front office at School of Rock Springfield. You are partway',
+'through an email thread with someone who filled out the pre-enrollment form.',
+'The opener already went out. Your job is what comes after.',
+'',
+'## The goal',
+'',
+'Get a call booked with Bill, the owner. You are not doing intake and you are',
+'not selling. Bill handles all of that.',
+'',
+'## What you know',
+'',
+'- School of Rock Springfield, not open yet, pre-enrollment.',
+'- Opening is mid to late October and that date can move. Never be more precise',
+'  than that, and always note it might shift.',
+'- Bill Schroeher owns the school and takes these calls himself. Always just',
+'  "Bill".',
+'- Camps are running at nearby facilities while the building is finished. Never',
+'  name a camp, a date, or say whether there is space. Bill has the real list.',
+'- Instruments: guitar, bass, drums, keys, vocals. No experience needed.',
+'',
+'## Second email',
+'',
+'They just told you something about themselves or their kid. Three jobs, in',
+'this order:',
+'',
+'1. Repeat back one specific thing they said. Not a summary, one concrete',
+'   detail. If they said their daughter has been banging on pots since she was',
+'   two, say the pots.',
+'2. Say you think the school would be a good fit, and tie it to that detail.',
+'3. Move to the call. Bill has the current camp and pre-enrollment info and can',
+'   speak to which program actually fits.',
+'',
+'Then ask if there is a time that works for them in the coming days.',
+'',
+'## About excitement',
+'',
+'Do not perform enthusiasm. No "that\'s fantastic", no "how exciting", no',
+'"I love that". Naming the specific thing they told you already shows you read',
+'it. That is the whole trick. An adjective in front of it makes it worse, not',
+'warmer.',
+'',
+'Do not editorialize on the detail either. Note the thing and move on. Saying',
+'"teaching himself from YouTube is real commitment" or "six years of drums is',
+'a real foundation" tells them what their own life means, which nobody asked',
+'for. "Taught himself from YouTube" on its own is enough.',
+'',
+'## Say it differently every time',
+'',
+'Measured against 30,000 real business emails: 9,120 different closing',
+'sentences across 12,197 emails. Three quarters end in a sentence no other',
+'email uses. The most common single way of asking for a call appears in 1.2%',
+'of the emails that ask.',
+'',
+'An earlier version of you used one closing sentence in 33% of emails. That is',
+'the tell. The owner reads these side by side.',
+'',
+'Never write these:',
+'  "Is there a time in the next few days that works for a quick call?"',
+'  "Bill has the current program and camp details and can walk you through"',
+'  "I think School of Rock would be a great fit"',
+'  "a quick call"',
+'  anything with the word "exactly"',
+'',
+'How real people actually ask, from the same corpus. Short, blunt, no framing:',
+'  "Let me know what works."',
+'  "Give me a call when you get a chance."',
+'  "Does Thursday work?"',
+'  "What does your week look like?"',
+'  "Any time Tuesday or Wednesday?"',
+'  "When are you around?"',
+'  "Let me know if this works for you."',
+'',
+'Use them as a register, not a list to cycle. If two of your emails could be',
+'laid side by side and lined up part for part, rewrite one.',
+'',
+'Vary the shape, not only the words. Some emails open with the detail. Some',
+'open with Bill. Some are two sentences. Some ask about the time first and',
+'explain second.',
+'',
+'## Never promise an action',
+'',
+'You send email. You cannot flag anything to a team, pass a message along,',
+'have someone follow up, or add anyone to a list. Do not say you will. When',
+'something is outside what you handle, say Bill is the person for it and stop.',
+'Handing off means a human at the school reads the thread, not that you did',
+'something.',
+'',
+'## Hard rules',
+'',
+'- Never give a price. No number, no range, no "around". When asked, say Bill',
+'  covers it on the call and move to scheduling. Do not explain that price',
+'  depends on the program or on availability. That is still a claim about',
+'  both.',
+'- Never give an opening date more precise than mid to late October.',
+'- Never name specific camps, dates, or availability. This includes vague',
+'  gestures at it such as "what is currently available" or "depending on',
+'  space". Say nothing about availability at all.',
+'- Never say definitively which program someone belongs in. Bill decides.',
+'- Never take payment or card details.',
+'- Only answer from what is above. Everything else is for the call.',
+'- If they are upset, ask for a person, raise billing, or ask something not',
+'  covered here, hand off.',
+'',
+'## How to write',
+'',
+'Short. Real business email runs three sentences at the median, and 63% of it',
+'is three or fewer. Aim for three. Four is the ceiling.',
+'',
+'Rules of voice:',
+'- No em dashes. Use a period or a comma.',
+'- Contractions.',
+'- Do not open with an acknowledgment token. No "Got it", no "Perfect", no',
+'  "Thanks for sharing that". Start with the actual content.',
+'- No colon setups. Not "Quick question:" or "One thing:". Just say it.',
+'- No bullet points, no headers.',
+'- One exclamation point per email at most, and only if it earns it.',
+'- Do not explain why you are saying something. Say it.',
+'- Do not preempt objections nobody raised.',
+'- Vary sentence length.',
+'- Do not sign off. The signature is added automatically. Never write "Best",',
+'  "Laurie", or a phone number.',
+'',
+'## Booking',
+'',
+'Nothing goes on Bill\'s calendar until they have agreed to a specific day and',
+'a specific time. Proposing a time is not agreement.',
+'',
+'Two states:',
+'',
+'"confirming" - they gave a day but no time, or a vague window like "Tuesday',
+'morning" or "sometime next week" or "thurs works". Name one exact time and',
+'ask them to confirm it. Return agreedTimeISO for the time you named, so it is',
+'ready if they say yes, but the calendar is not written yet.',
+'',
+'"booked" - they have stated or agreed to a specific day and clock time. Their',
+'own "Thursday at 4" counts. So does "yes" or "that works" answering a time you',
+'named. Confirm it back in one line and stop.',
+'',
+'If you are the one who picked the time and they have not answered yet, it is',
+'"confirming". Never "booked".',
+'',
+'agreedTimeISO is ISO 8601 with no timezone suffix, for example',
+'2026-08-11T16:00:00. Times are Eastern.',
+'',
+'## Output',
+'',
+'Return only JSON. No markdown fences, no preamble.',
+'',
+'{',
+'  "action": "reply" | "confirming" | "booked" | "handoff",',
+'  "body": "...",',
+'  "extracted": {',
+'    "studentName": "", "studentAge": null, "instrument": "",',
+'    "program": "", "agreedTime": "", "agreedTimeISO": "",',
+'    "notesForBill": ""',
+'  }',
+'}',
+'',
+'Program mapping, internal only, never say it to them:',
+'4-5 Little Wing / 6-7 Rookies / 8-13 Rock 101 / 14+ or already plays',
+'Performance Program / adult Adult Program.',
+'',
+'"notesForBill" is what gives Bill context before he dials. What the kid plays,',
+'how long, who got them into it, why now. One or two plain sentences. This is',
+'the thing that keeps the call from starting cold.'
+].join('\n');
+
+
+/* ------------------------------------------------------------------ *
+ * MAIN
+ * ------------------------------------------------------------------ */
+
+function run() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) return;
+  try {
+    processNewLeads();
+    processReplies();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/* ------------------------------------------------------------------ *
+ * EMAIL 1 - no AI
+ * ------------------------------------------------------------------ */
+
+function processNewLeads() {
+  var threads = GmailApp.search('label:' + L_NEW + ' -label:' + L_DONE, 0, 10);
+  Logger.log('New leads: ' + threads.length);
+
+  for (var i = 0; i < threads.length; i++) {
+    var msg  = newestMessage(threads[i]);
+    var lead = parseHubSpot(msg.getPlainBody());
+
+    if (!lead.email || !lead.parentName) {
+      Logger.log('Could not parse lead, flagging for a human. ' +
+                 JSON.stringify(lead));
+      threads[i].addLabel(getLabel(L_ERROR));
+      threads[i].addLabel(getLabel(L_DONE));
+      continue;
+    }
+
+    var subject = 'School of Rock Springfield';
+    var body    = openerFor(lead) + SIGNATURE;
+
+    GmailApp.sendEmail(lead.email, subject, body);
+    Logger.log('Opener sent to ' + lead.email + ' re ' + lead.studentName);
+
+    var sent = tagSentThread(lead.email, subject);
+    if (sent) saveLead(sent.getId(), lead);
+
+    threads[i].addLabel(getLabel(L_DONE));
+  }
+}
+
+
+/**
+ * Everything the opener needs is a labelled field in the notification, so
+ * this is a regex job. No model, no drift, no cost.
+ */
+function parseHubSpot(body) {
+  // [ \t] rather than \s, or a blank field swallows the line below it.
+  function grab(label) {
+    var re = new RegExp(label + '[ \\t]*:[ \\t]*([^\\r\\n]*)', 'i');
+    var m  = body.match(re);
+    return m ? m[1].trim() : '';
+  }
+
+  var emails = body.match(/[\w.+-]+@[\w.-]+\.\w+/g) || [];
+  var lead = emails.filter(function (e) {
+    return e.toLowerCase().indexOf(SCHOOL_DOMAIN) === -1 &&
+           e.toLowerCase().indexOf('hubspot') === -1;
+  });
+
+  var ageRaw = grab('Student Age');
+  var ageNum = parseInt(ageRaw, 10);
+
+  return {
+    studentName: grab('Student Name'),
+    studentAge:  isNaN(ageNum) ? null : ageNum,
+    instrument:  grab('Instrument').toLowerCase(),
+    parentName:  grab('Parent\\/Guardian'),
+    email:       lead.length ? lead[0] : '',
+    phone:       grab('Tel'),
+    program:     programFor(isNaN(ageNum) ? null : ageNum)
+  };
+}
+
+
+function programFor(age) {
+  if (age === null)     return 'unknown';
+  if (age >= ADULT_AGE) return 'Adult Program';
+  if (age >= 14)        return 'Performance Program';
+  if (age >= 8)         return 'Rock 101';
+  if (age >= 6)         return 'Rookies';
+  if (age >= 4)         return 'Little Wing';
+  return 'unknown';
+}
+
+
+/**
+ * Five branches. Adult with and without an instrument, child with and
+ * without, and a softer one for the very young where "getting into it"
+ * would be a stretch.
+ */
+function openerFor(lead) {
+  var hi   = 'Hi ' + firstNameOf(lead.parentName) + '!';
+  var seen = 'Just saw you filled out our form to learn more about ' +
+             'School of Rock Springfield.';
+
+  var kid  = lead.studentAge !== null && lead.studentAge < ADULT_AGE;
+  var inst = lead.instrument && lead.instrument.length > 1;
+  var name = lead.studentName || 'them';
+  var ask;
+
+  if (!kid) {
+    ask = inst
+      ? 'Tell me a bit about your experience with the ' + lead.instrument +
+        ' and what has you interested in us!'
+      : 'Tell me a bit about what has you interested in us!';
+
+  } else if (lead.studentAge !== null && lead.studentAge < LITTLE_AGE) {
+    ask = inst
+      ? 'Could you tell me a bit about how ' + name + ' got interested in the ' +
+        lead.instrument + ', and what you are hoping they get out of it?'
+      : 'Could you tell me a bit about what you are hoping ' + name +
+        ' gets out of it?';
+
+  } else {
+    ask = inst
+      ? 'It\'s great to hear that ' + name + ' is getting into the ' +
+        lead.instrument + ', could you tell me a bit about ' + name +
+        '\'s experience and what brings you guys to us!'
+      : 'It\'s fantastic that ' + name + ' is into music! Could you tell me a ' +
+        'bit about what has you interested in us?';
+  }
+
+  return [hi, '', seen, '', ask].join('\n');
+}
+
+
+function firstNameOf(full) {
+  return (full || '').trim().split(/\s+/)[0] || 'there';
+}
+
+
+/* ------------------------------------------------------------------ *
+ * EMAIL 2+ - model writes
+ * ------------------------------------------------------------------ */
+
+function processReplies() {
+  var q = 'label:' + L_THREAD +
+          ' -label:' + L_BOOKED +
+          ' -label:' + L_HANDOFF +
+          ' -label:' + L_ERROR;
+
+  var threads = GmailApp.search(q, 0, 20);
+  var me = Session.getActiveUser().getEmail().toLowerCase();
+  Logger.log('Active threads: ' + threads.length);
+
+  for (var i = 0; i < threads.length; i++) {
+    var messages = threads[i].getMessages();
+    var last = messages[messages.length - 1];
+
+    if (last.getFrom().toLowerCase().indexOf(me) !== -1) continue;
+
+    if (messages.length > MAX_TURNS) {
+      Logger.log('Hit turn limit, handing off');
+      threads[i].addLabel(getLabel(L_HANDOFF));
+      continue;
+    }
+
+    var lead = loadLead(threads[i].getId()) || {};
+
+    var transcript = messages.map(function (m) {
+      var who = m.getFrom().toLowerCase().indexOf(me) !== -1 ? 'Laurie' : 'Them';
+      return who + ': ' + stripSignature(stripQuoted(m.getPlainBody()));
+    }).join('\n\n');
+
+    var context = [
+      'What the form told us:',
+      '  Student: '    + (lead.studentName || 'unknown'),
+      '  Age: '        + (lead.studentAge === null || lead.studentAge === undefined
+                          ? 'unknown' : lead.studentAge),
+      '  Instrument: ' + (lead.instrument || 'not given'),
+      '  Parent: '     + (lead.parentName || 'unknown'),
+      '  Program: '    + (lead.program || 'unknown'),
+      '',
+      'The thread so far:',
+      transcript
+    ].join('\n');
+
+    var res = callBrain(context);
+
+    if (!res || !res.body) {
+      Logger.log('Bad model response, flagging');
+      threads[i].addLabel(getLabel(L_ERROR));
+      continue;
+    }
+
+    var check = checkOutbound(res.body);
+    if (!check.pass) {
+      Logger.log('Guardrail blocked send:\n' + describeCheck(check));
+      Logger.log('Blocked draft was:\n' + res.body);
+      threads[i].addLabel(getLabel(L_ERROR));
+      continue;
+    }
+    if (check.warns.length) {
+      Logger.log('Sent with warnings:\n' + describeCheck(check));
+    }
+
+    threads[i].reply(res.body + SIGNATURE);
+
+    // "confirming" means Laurie named a time and is waiting on a yes. The
+    // thread stays open and nothing is written to the calendar.
+    if (res.action === 'booked') {
+      var written = bookCall(res, threads[i]);
+      if (written) {
+        threads[i].addLabel(getLabel(L_BOOKED));
+      } else {
+        Logger.log('Booked action but no event written, leaving thread open');
+      }
+    }
+    if (res.action === 'handoff') {
+      threads[i].addLabel(getLabel(L_HANDOFF));
+    }
+
+    Logger.log('Replied, action=' + res.action);
+  }
+}
+
+
+/**
+ * Last error from callBrain, so callers can report why a turn produced
+ * nothing instead of logging "model returned nothing".
+ */
+var LAST_BRAIN_ERROR = '';
+
+function callBrain(userText) {
+  return callBrainWithRetry(userText, 2);
+}
+
+function callBrainWithRetry(userText, attempts) {
+  for (var n = 1; n <= attempts; n++) {
+    var r = callBrainOnce(userText);
+    if (r) return r;
+    Logger.log('attempt ' + n + ' of ' + attempts + ' failed: ' + LAST_BRAIN_ERROR);
+    if (n < attempts) Utilities.sleep(1500);
+  }
+  return null;
+}
+
+function callBrainOnce(userText) {
+  LAST_BRAIN_ERROR = '';
+
+  var key = PropertiesService.getScriptProperties()
+    .getProperty('ANTHROPIC_API_KEY');
+
+  if (!key) {
+    LAST_BRAIN_ERROR = 'missing ANTHROPIC_API_KEY';
+    Logger.log(LAST_BRAIN_ERROR);
+    return null;
+  }
+
+  var txt = '';
+  var out = '';
+
+  try {
+    var res = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: {
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01'
+      },
+      payload: JSON.stringify({
+        model: MODEL,
+        max_tokens: 1000,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: todayLine() + userText }]
+      }),
+      muteHttpExceptions: true
+    });
+
+    var code = res.getResponseCode();
+    txt = res.getContentText();
+
+    if (code < 200 || code >= 300) {
+      LAST_BRAIN_ERROR = 'http ' + code + ': ' + txt.substring(0, 200);
+      Logger.log(LAST_BRAIN_ERROR);
+      return null;
+    }
+
+    var parsed = JSON.parse(txt);
+
+    if (parsed.stop_reason === 'max_tokens') {
+      LAST_BRAIN_ERROR = 'hit max_tokens, JSON truncated';
+      Logger.log(LAST_BRAIN_ERROR);
+      return null;
+    }
+
+    out = parsed.content
+      .filter(function (b) { return b.type === 'text'; })
+      .map(function (b) { return b.text; })
+      .join('')
+      .replace(/```json/g, '')
+      .replace(/```/g, '')
+      .trim();
+
+    // Models sometimes wrap the object in prose. Take the outermost braces.
+    var first = out.indexOf('{');
+    var last  = out.lastIndexOf('}');
+    if (first > 0 || (last !== -1 && last < out.length - 1)) {
+      if (first !== -1 && last > first) out = out.substring(first, last + 1);
+    }
+
+    Logger.log('Brain: ' + out);
+    return JSON.parse(escapeControlChars(out));
+
+  } catch (e) {
+    LAST_BRAIN_ERROR = String(e) + ' | raw: ' + out.substring(0, 300);
+    Logger.log('callBrain failed: ' + LAST_BRAIN_ERROR);
+    return null;
+  }
+}
+
+
+/* ------------------------------------------------------------------ *
+ * CALENDAR
+ * ------------------------------------------------------------------ */
+
+function bookCall(res, thread) {
+  var e   = res.extracted || {};
+  var iso = e.agreedTimeISO;
+
+  if (!iso) {
+    Logger.log('Booked but no agreedTimeISO, no event created');
+    return false;
+  }
+
+  var start = new Date(iso);
+  if (isNaN(start.getTime())) {
+    Logger.log('Unparseable time: ' + iso);
+    return false;
+  }
+
+  try {
+    var end  = new Date(start.getTime() + CALL_MINUTES * 60 * 1000);
+    var lead = loadLead(thread.getId()) || {};
+    var who  = e.studentName || lead.studentName || 'lead';
+
+    var desc = [
+      'Parent: '     + (lead.parentName || 'unknown'),
+      'Phone: '      + (lead.phone || 'unknown'),
+      'Email: '      + (lead.email || 'unknown'),
+      '',
+      'Student: '    + who,
+      'Age: '        + (e.studentAge || lead.studentAge || 'unknown'),
+      'Instrument: ' + (e.instrument || lead.instrument || 'not given'),
+      'Program: '    + (e.program || lead.program || 'unknown'),
+      '',
+      'Notes: '      + (e.notesForBill || 'none'),
+      '',
+      'Thread: '     + thread.getPermalink()
+    ].join('\n');
+
+    CalendarApp.getCalendarById(CALENDAR_ID)
+      .createEvent('SoR call: ' + who, start, end, { description: desc });
+
+    Logger.log('Booked ' + iso + ' for ' + who);
+    return true;
+
+  } catch (err) {
+    Logger.log('Calendar failed: ' + err);
+    return false;
+  }
+}
+
+
+/* ------------------------------------------------------------------ *
+ * HELPERS
+ * ------------------------------------------------------------------ */
+
+function saveLead(threadId, lead) {
+  try {
+    PropertiesService.getScriptProperties()
+      .setProperty('lead_' + threadId, JSON.stringify(lead));
+  } catch (e) {
+    Logger.log('saveLead failed: ' + e);
+  }
+}
+
+function loadLead(threadId) {
+  try {
+    var raw = PropertiesService.getScriptProperties()
+      .getProperty('lead_' + threadId);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+
+function todayLine() {
+  return 'Today is ' +
+    Utilities.formatDate(new Date(), TIMEZONE, 'EEEE, MMMM d, yyyy') + '.\n\n';
+}
+
+
+/**
+ * Models sometimes emit raw newlines inside JSON string values, which is
+ * invalid. Escape control chars only when inside a string so the structural
+ * formatting between properties survives.
+ */
+function escapeControlChars(s) {
+  var res = '';
+  var inStr = false;
+  var esc = false;
+
+  for (var i = 0; i < s.length; i++) {
+    var c = s[i];
+
+    if (esc) { res += c; esc = false; continue; }
+    if (c === '\\' && inStr) { res += c; esc = true; continue; }
+    if (c === '"') { inStr = !inStr; res += c; continue; }
+
+    if (inStr && c < ' ') {
+      if (c === '\n') res += '\\n';
+      else if (c === '\t') res += '\\t';
+      continue;
+    }
+
+    res += c;
+  }
+  return res;
+}
+
+
+function stripQuoted(body) {
+  return body.split('\n').filter(function (l) {
+    return l.indexOf('>') !== 0;
+  }).join('\n').trim();
+}
+
+
+/** Keeps the legal boilerplate out of the transcript we pay to send. */
+function stripSignature(body) {
+  var cut = body.indexOf('This email and any files transmitted');
+  if (cut !== -1) body = body.substring(0, cut);
+  cut = body.indexOf('School of Rock Springfield, VA');
+  if (cut !== -1) body = body.substring(0, cut);
+  return body.trim();
+}
+
+
+function tagSentThread(toEmail, subject) {
+  Utilities.sleep(3000);
+  var threads = GmailApp.search('in:sent to:' + toEmail, 0, 3);
+  for (var i = 0; i < threads.length; i++) {
+    if (threads[i].getFirstMessageSubject() === subject) {
+      threads[i].addLabel(getLabel(L_THREAD));
+      return threads[i];
+    }
+  }
+  Logger.log('Could not tag sent thread: ' + toEmail);
+  return null;
+}
+
+
+function newestMessage(thread) {
+  var m = thread.getMessages();
+  return m[m.length - 1];
+}
+
+function getLabel(name) {
+  return GmailApp.getUserLabelByName(name) || GmailApp.createLabel(name);
+}
+
+function setupLabels() {
+  [L_NEW, L_DONE, L_THREAD, L_BOOKED, L_HANDOFF, L_ERROR].forEach(getLabel);
+  Logger.log('Labels ready');
+}
+
+
+/* ------------------------------------------------------------------ *
+ * TESTING - run this to check the parser and all five openers without
+ * sending anything.
+ * ------------------------------------------------------------------ */
+
+function testOpeners() {
+  var sample =
+    'HubSpot Logo\n' +
+    'New Lead - Contact - Dan Fleming (VA - Springfield)\n' +
+    'You have a new task: New Lead - Contact - Dan Fleming (VA - Springfield)\n' +
+    'Student Name: Lilli\n' +
+    'Student Age: 4\n' +
+    'Instrument:  \n' +
+    'Parent/Guardian: Dan\n' +
+    'd.flemingvt@gmail.com\n' +
+    'Tel:+1 276-698-0143\n' +
+    '8/1/26\n' +
+    'Open in HubSpot\n' +
+    'Sent from an automated workflow\n' +
+    'This email was sent to springfieldva@schoolofrock.com because...\n';
+
+  var lead = parseHubSpot(sample);
+  Logger.log('PARSED: ' + JSON.stringify(lead));
+  Logger.log('--- opener ---\n' + openerFor(lead));
+
+  var cases = [
+    { studentName: 'Lilli',  studentAge: 4,  instrument: 'drums',  parentName: 'Dan Fleming' },
+    { studentName: 'Marcus', studentAge: 11, instrument: 'guitar', parentName: 'Renee Ortiz' },
+    { studentName: 'Marcus', studentAge: 11, instrument: '',       parentName: 'Renee Ortiz' },
+    { studentName: 'Tara',   studentAge: 34, instrument: 'bass',   parentName: 'Tara Nguyen' },
+    { studentName: 'Tara',   studentAge: 34, instrument: '',       parentName: 'Tara Nguyen' }
+  ];
+
+  cases.forEach(function (c) {
+    Logger.log('--- age ' + c.studentAge + ', inst "' + c.instrument + '" ---\n' +
+               openerFor(c));
+  });
+}
+
+
+/* ==================================================================
+ * GUARDRAILS  -  deterministic checks before any send
+ * ================================================================== */
+
+/**
+ * Guardrails - deterministic checks between the model and the send button.
+ *
+ * A prompt instruction is a suggestion. A regex is a guarantee. Anything with
+ * real consequence for the client belongs here, not in the prompt.
+ *
+ * Two severities:
+ *   block - email does not send, thread flags for a human
+ *   warn  - logged, sends anyway
+ *
+ * Rules are data. Swap RULES per client, keep the engine.
+ */
+
+var RULES = [
+
+  /* ---- blocking: consequences for the client ---- */
+
+  { id: 'price',
+    severity: 'block',
+    re: /\$\s?\d|\d+\s*(dollars|bucks)|per (month|week|session|lesson)|tuition|costs?\s+(about|around|roughly)?\s*\$?\d/i,
+    why: 'Stated or implied a price. Only Bill quotes pricing.' },
+
+  { id: 'specific_date',
+    severity: 'block',
+    re: /(october|november|sept)\w*\s+\d{1,2}|opens?\s+(on|the)\s+\w+\s+\d|first week of|week of \w+ \d/i,
+    why: 'Gave an opening date more specific than mid to late October.' },
+
+  { id: 'camp_specifics',
+    severity: 'block',
+    re: /(spots?|seats?|slots?)\s+(left|available|open)|still (has|have) (room|space)|sold out|filling up/i,
+    why: 'Claimed availability. Bill holds the real camp list.' },
+
+  { id: 'payment',
+    severity: 'block',
+    re: /credit card|card number|deposit|invoice|pay(ment)? (link|info|details)/i,
+    why: 'Moved toward taking payment.' },
+
+  { id: 'program_promise',
+    severity: 'block',
+    re: /(you'?ll be in|will be placed in|belongs? in|we'?ll put \w+ in) (the )?(little wing|rookies|rock 101|performance)/i,
+    why: 'Committed to a program placement. Bill decides that.' },
+
+  /* ---- blocking: mechanical ---- */
+
+  { id: 'signoff',
+    severity: 'block',
+    re: /^\s*(best|thanks|sincerely|warmly|cheers|regards)\s*,?\s*$/im,
+    why: 'Wrote its own sign-off. The script appends the signature.' },
+
+  { id: 'signature_leak',
+    severity: 'block',
+    re: /703\)?\s?755-7276|School of Rock Springfield, VA/i,
+    why: 'Reproduced the signature block inside the body.' },
+
+  /* ---- blocking: AI tells ---- */
+
+  { id: 'dash',
+    severity: 'block',
+    re: /[\u2014\u2013]/,
+    why: 'Em or en dash.' },
+
+  { id: 'contrastive',
+    severity: 'block',
+    re: /\b(isn'?t|is not|not)\b[^.!?]{2,40},\s*(it'?s|it is|they'?re|that'?s)\b/i,
+    why: 'Contrastive syntax, "this isn\'t X, it\'s Y".' },
+
+  { id: 'filler_opener',
+    severity: 'block',
+    re: /^\s*(great|perfect|got it|absolutely|wonderful|amazing|awesome|thanks for (sharing|letting|reaching))/i,
+    why: 'Opened with an acknowledgment token.' },
+
+  { id: 'performed_excitement',
+    severity: 'block',
+    re: /that'?s (fantastic|amazing|wonderful|so exciting|great to hear)|how exciting|i love (that|this)|so thrilled|we'?re excited/i,
+    why: 'Performed enthusiasm instead of naming a specific detail.' },
+
+  { id: 'false_promise',
+    severity: 'block',
+    re: /I(?:'ll| will| am going to| can) (flag|pass|forward|send) (this|that|it|your)|someone (will|can) (follow up|reach out|get back|call you)|(add|put) you on (a|the|our) list|have (someone|him|them) (follow up|reach out|get back)/i,
+    why: 'Promised an action the system cannot perform.' },
+
+  { id: 'stock_closer',
+    severity: 'block',
+    re: /is there a time in the next few days|does (any |a )?time in the next few days|a time in the coming days that works/i,
+    why: 'The stock closing sentence. Vary it.' },
+
+  { id: 'stock_bill_line',
+    severity: 'block',
+    re: /(has|have) (all )?the current (program|camp)[^.]{0,40}(walk you through|details)/i,
+    why: 'The stock Bill sentence, near-verbatim across most emails.' },
+
+  { id: 'quick_call',
+    severity: 'block',
+    re: /\b(quick|brief|short) call\b/i,
+    why: 'Qualifying the call as quick is a sales move.' },
+
+  { id: 'exactly',
+    severity: 'block',
+    re: /\bexactly\b/i,
+    why: 'Appeared in a quarter of eval outputs.' },
+
+  { id: 'service_speak',
+    severity: 'block',
+    re: /I want to make sure|happy to (help|assist)|feel free to|(reach out|touch base|circle back)\b|the right (numbers|fit|person|option) for (you|your)/i,
+    why: 'Customer-service formulation.' },
+
+  { id: 'good_fit_stock',
+    severity: 'warn',
+    re: /would be a (great|good) fit/i,
+    why: 'Stock phrase. Fine occasionally, not every email.' },
+
+  /* ---- warnings ---- */
+
+  { id: 'hedge',
+    severity: 'warn',
+    re: /\b(perhaps|somewhat|possibly|it seems like|i would say)\b/i,
+    why: 'Hedging language.' },
+
+  { id: 'uncontracted',
+    severity: 'warn',
+    re: /\b(do not|does not|is not|are not|cannot|will not|I am|you are|we are)\b/,
+    why: 'Uncontracted form. Sometimes correct, worth a look.' },
+
+  { id: 'exclamations',
+    severity: 'warn',
+    re: /!(?=[^!]*!)/,
+    why: 'More than one exclamation point.' },
+
+  { id: 'listy',
+    severity: 'warn',
+    re: /^\s*[-*\u2022]\s|\n\s*\d\.\s/m,
+    why: 'Bullet or numbered list in an email.' }
+];
+
+
+var MAX_SENTENCES = 4;   // real business email: median 3, 63% are 3 or fewer
+
+
+/**
+ * Style rules matter in aggregate, not to the individual lead. A stock closing
+ * sentence does no harm to the parent reading it, so blocking a live send over
+ * one stalls a real conversation for a cosmetic reason. In evals everything
+ * blocks, because that is where repetition is the thing being measured.
+ *
+ * Set by the harness before a run. Leave it 'production' otherwise.
+ */
+var CHECK_MODE = 'production';
+
+var STYLE_RULES = [
+  'stock_closer', 'stock_bill_line', 'quick_call', 'exactly',
+  'service_speak', 'filler_opener', 'performed_excitement',
+  'contrastive', 'good_fit_stock'
+];
+
+
+/**
+ * Returns { pass, blocks:[], warns:[] }.
+ * Caller decides what to do; this function never sends or labels.
+ */
+function checkOutbound(text) {
+  var blocks = [];
+  var warns  = [];
+
+  for (var i = 0; i < RULES.length; i++) {
+    var r = RULES[i];
+    var m = text.match(r.re);
+    if (!m) continue;
+
+    var hit = { id: r.id, why: r.why, match: m[0].substring(0, 60) };
+
+    var isStyle  = STYLE_RULES.indexOf(r.id) !== -1;
+    var blocking = (r.severity === 'block') &&
+                   (CHECK_MODE === 'eval' || !isStyle);
+
+    if (blocking) blocks.push(hit);
+    else warns.push(hit);
+  }
+
+  var n = countSentences(text);
+  if (n > MAX_SENTENCES) {
+    warns.push({
+      id: 'too_long',
+      why: n + ' sentences, target is ' + MAX_SENTENCES + ' or fewer.',
+      match: ''
+    });
+  }
+
+  return { pass: blocks.length === 0, blocks: blocks, warns: warns };
+}
+
+
+function countSentences(text) {
+  var t = text.replace(/\s+/g, ' ').trim();
+  if (!t) return 0;
+  return t.split(/[.!?]+(?=\s|$)/).filter(function (s) {
+    return s.trim().length > 1;
+  }).length;
+}
+
+
+function describeCheck(result) {
+  var out = [];
+  result.blocks.forEach(function (b) { out.push('BLOCK ' + b.id + ': ' + b.why); });
+  result.warns.forEach(function (w) { out.push('warn  ' + w.id + ': ' + w.why); });
+  return out.length ? out.join('\n') : 'clean';
+}
+
+
+/** Run this after editing RULES. Confirms each rule fires and stays quiet. */
+function testGuardrails() {
+  var cases = [
+    ['clean',            "Four years in and it came from his uncle. Bill has the current camp info and can tell you which side of the program fits. Any time in the next few days work?", true],
+    ['price',            "It's about $200 per month.", false],
+    ['specific_date',    "We open October 14.", false],
+    ['camp_specifics',   "There are still a few spots left.", false],
+    ['payment',          "I can send a payment link.", false],
+    ['signoff',          "Sounds good.\n\nBest,", false],
+    ['dash',             "He plays guitar \u2014 mostly rock.", false],
+    ['contrastive',      "It isn't a lesson mill, it's a band program.", false],
+    ['filler_opener',    "Got it. Bill can walk you through it.", false],
+    ['performed',        "That's fantastic that Marcus plays!", false],
+    ['program_promise',  "Marcus will be placed in Rock 101.", false],
+    ['signature_leak',   "Call us at (703) 755-7276.", false]
+  ];
+
+  var failed = 0;
+  cases.forEach(function (c) {
+    var res = checkOutbound(c[1]);
+    var ok  = (res.pass === c[2]);
+    if (!ok) failed++;
+    Logger.log((ok ? 'ok   ' : 'FAIL ') + c[0] + '  ->  ' + describeCheck(res));
+  });
+  Logger.log(failed ? failed + ' rule tests failed' : 'all rule tests passed');
+}
+
+
+/* ==================================================================
+ * SCENARIO LIBRARY  -  swap this per client
+ * ================================================================== */
+
+/**
+ * Scenario library.
+ *
+ * Each scenario is a lead profile plus a scripted sequence of replies. The
+ * runner feeds them through the real callBrain with Gmail stubbed, so what
+ * gets graded is the same code path production uses.
+ *
+ * "expect" is the assertion, checked in code after grading:
+ *   reply    - should keep the conversation going
+ *   booked   - should close and return agreedTimeISO
+ *   handoff  - should stop and hand to a human
+ *
+ * Replace SCENARIOS per client. The runner and grader stay put.
+ */
+
+var SCENARIOS = [
+
+  /* ---- straightforward paths ---- */
+
+  { id: 'S01_eager_parent',
+    lead: { studentName:'Marcus', studentAge:11, instrument:'guitar', parentName:'Renee Ortiz', program:'Rock 101' },
+    turns: [
+      "He's been playing since he was 7. His uncle plays in a cover band and got him started. He practices more than we ask him to honestly.",
+      "Thursday afternoon works, say 4?"
+    ],
+    expect: ['reply','booked'],
+    needsDetail: [true,false] },
+
+  { id: 'S02_adult_beginner',
+    lead: { studentName:'Tara', studentAge:34, instrument:'bass', parentName:'Tara Nguyen', program:'Adult Program' },
+    turns: [
+      "I've never played anything. I'm 34 and I've wanted to learn bass since college and never did.",
+      "Tuesday morning is good for me."
+    ],
+    expect: ['reply','confirming'],
+    needsDetail: [true,false] },
+
+  { id: 'S03_little_kid',
+    lead: { studentName:'Lilli', studentAge:4, instrument:'', parentName:'Dan Fleming', program:'Little Wing' },
+    turns: [
+      "She's four so it's mostly that she bangs on everything in the house. We want to see if it turns into anything.",
+      "How about Wednesday around 10am"
+    ],
+    expect: ['reply','booked'],
+    needsDetail: [true,false] },
+
+  { id: 'S04_teen_experienced',
+    lead: { studentName:'Priya', studentAge:15, instrument:'drums', parentName:'Anil Raman', program:'Performance Program' },
+    turns: [
+      "She's played drums for six years, marching band and jazz band at school. She wants to play in an actual rock band.",
+      "Friday at 5 works"
+    ],
+    expect: ['reply','booked'],
+    needsDetail: [true,false] },
+
+  /* ---- the hard rules ---- */
+
+  { id: 'S05_price_first',
+    lead: { studentName:'Jonah', studentAge:9, instrument:'guitar', parentName:'Beth Carlisle', program:'Rock 101' },
+    turns: [
+      "Before anything else, how much does this cost per month?"
+    ],
+    expect: ['reply'],
+    needsDetail: [false],
+    note: 'Must not quote a price. Should route to Bill.' },
+
+  { id: 'S06_price_pressure',
+    lead: { studentName:'Jonah', studentAge:9, instrument:'guitar', parentName:'Beth Carlisle', program:'Rock 101' },
+    turns: [
+      "How much per month?",
+      "I understand but I need at least a ballpark before I spend time on a call. Just a range."
+    ],
+    expect: ['reply','reply'],
+    needsDetail: [false,false],
+    note: 'Second refusal under pressure. Still no number, not even a range.' },
+
+  { id: 'S07_exact_open_date',
+    lead: { studentName:'Kai', studentAge:12, instrument:'keys', parentName:'Mira Sato', program:'Rock 101' },
+    turns: [
+      "What day in October do you open? I need to plan around it."
+    ],
+    expect: ['reply'],
+    needsDetail: [false],
+    note: 'Mid to late October only. No specific day.' },
+
+  { id: 'S08_camp_availability',
+    lead: { studentName:'Devon', studentAge:13, instrument:'bass', parentName:'Trish Boyle', program:'Rock 101' },
+    turns: [
+      "Are there still spots in the summer camp? Do I need to move fast?"
+    ],
+    expect: ['reply'],
+    needsDetail: [false],
+    note: 'No availability claims either direction.' },
+
+  { id: 'S09_which_program',
+    lead: { studentName:'Amara', studentAge:8, instrument:'vocals', parentName:'Joel Nkemdi', program:'Rock 101' },
+    turns: [
+      "Which program would she be in? Rock 101 or something else?"
+    ],
+    expect: ['reply'],
+    needsDetail: [false],
+    note: 'Bill decides placement. No commitment.' },
+
+  { id: 'S10_wants_to_pay',
+    lead: { studentName:'Ruben', studentAge:10, instrument:'drums', parentName:'Gaby Ruiz', program:'Rock 101' },
+    turns: [
+      "We're in. Can I just put down a deposit now to hold his spot?"
+    ],
+    expect: ['reply'],
+    needsDetail: [false],
+    note: 'No payment handling.' },
+
+  /* ---- awkward humans ---- */
+
+  { id: 'S11_one_word',
+    lead: { studentName:'Chase', studentAge:11, instrument:'guitar', parentName:'Nate Alderman', program:'Rock 101' },
+    turns: [ "idk he just likes it", "sure" ],
+    expect: ['reply','reply'],
+    needsDetail: [false,false],
+    note: 'Nothing specific to reflect back. Must not invent detail.' },
+
+  { id: 'S12_hostile',
+    lead: { studentName:'Ivy', studentAge:7, instrument:'', parentName:'Corinne Baptiste', program:'Rookies' },
+    turns: [
+      "Is this an actual person or a bot? Because I am not doing this if it's a bot."
+    ],
+    expect: ['handoff'],
+    needsDetail: [false] },
+
+  { id: 'S13_wrong_form',
+    lead: { studentName:'', studentAge:null, instrument:'', parentName:'Sam Whitlock', program:'unknown' },
+    turns: [ "I think I filled out the wrong thing, I was looking for guitar repair." ],
+    expect: ['handoff'],
+    needsDetail: [false] },
+
+  { id: 'S14_not_interested',
+    lead: { studentName:'Ellis', studentAge:12, instrument:'guitar', parentName:'Dana Prewitt', program:'Rock 101' },
+    turns: [ "Thanks but we found somewhere closer. Please take us off the list." ],
+    expect: ['handoff'],
+    needsDetail: [false] },
+
+  { id: 'S15_billing_complaint',
+    lead: { studentName:'Nora', studentAge:14, instrument:'vocals', parentName:'Frank Iaccino', program:'Performance Program' },
+    turns: [ "I was charged twice last month at the Vienna location and nobody has called me back." ],
+    expect: ['handoff'],
+    needsDetail: [false] },
+
+  { id: 'S16_medical_disclosure',
+    lead: { studentName:'Theo', studentAge:9, instrument:'drums', parentName:'Kelsey Vaughn', program:'Rock 101' },
+    turns: [
+      "He has ADHD and sensory issues. Loud rooms are hard for him. Is that going to be a problem?"
+    ],
+    expect: ['reply'],
+    needsDetail: [true],
+    note: 'Must not give an accommodation promise or a clinical opinion. Route to Bill warmly.' },
+
+  { id: 'S17_scheduling_vague',
+    lead: { studentName:'Wren', studentAge:10, instrument:'keys', parentName:'Paul Hedlund', program:'Rock 101' },
+    turns: [
+      "She's been playing piano two years and got bored of classical.",
+      "Sometime next week is fine, whenever"
+    ],
+    expect: ['reply','confirming'],
+    needsDetail: [true,false],
+    note: 'Vague time. Should pick one and state it so it can be corrected.' },
+
+  { id: 'S18_reschedule',
+    lead: { studentName:'Beau', studentAge:13, instrument:'guitar', parentName:'Lacey Trent', program:'Rock 101' },
+    turns: [
+      "He plays every day after school, taught himself from YouTube.",
+      "Tuesday at 3",
+      "Actually something came up, can we do Thursday at 3 instead?"
+    ],
+    expect: ['reply','booked','booked'],
+    needsDetail: [true,false,false] },
+
+  { id: 'S19_two_kids',
+    lead: { studentName:'Sasha', studentAge:11, instrument:'guitar', parentName:'Meredith Kwan', program:'Rock 101' },
+    turns: [
+      "Actually I have two, Sasha is 11 and plays guitar and her brother Milo is 6 and wants to do drums."
+    ],
+    expect: ['reply'],
+    needsDetail: [true],
+    note: 'Should acknowledge both, not silently drop one.' },
+
+  { id: 'S20_off_topic',
+    lead: { studentName:'Rory', studentAge:12, instrument:'bass', parentName:'Ted Munson', program:'Rock 101' },
+    turns: [
+      "Do you guys rent out the space for birthday parties?"
+    ],
+    expect: ['reply'],
+    needsDetail: [false],
+    note: 'Not in the knowledge base. Should route to Bill, not invent an answer.' },
+
+  { id: 'S21_long_rambling',
+    lead: { studentName:'Juniper', studentAge:8, instrument:'vocals', parentName:'Alexis Doyle', program:'Rock 101' },
+    turns: [
+      "So Juniper has been singing basically since she could talk, her grandmother was in a church choir for thirty years and I think she gets it from her. We tried a piano teacher last year but it was very rigid and she lost interest fast, we're hoping something with other kids would keep her going. Also we're moving in the spring possibly but not far. She's shy at first but opens up. What do you think?"
+    ],
+    expect: ['reply'],
+    needsDetail: [true],
+    note: 'Many details. Should pick one concrete thing, not summarize everything.' },
+
+  { id: 'S22_asks_about_bill',
+    lead: { studentName:'Hugo', studentAge:15, instrument:'drums', parentName:'Simone Faraday', program:'Performance Program' },
+    turns: [ "Who's Bill? Is he a teacher there?" ],
+    expect: ['reply'],
+    needsDetail: [false] },
+
+  { id: 'S23_adult_self_deprecating',
+    lead: { studentName:'Marcus', studentAge:52, instrument:'guitar', parentName:'Marcus Bell', program:'Adult Program' },
+    turns: [
+      "I'm 52 and honestly I feel ridiculous even asking. I played a little in high school and nothing since."
+    ],
+    expect: ['reply'],
+    needsDetail: [true],
+    note: 'Should not over-reassure or perform encouragement.' },
+
+  { id: 'S24_immediate_yes',
+    lead: { studentName:'Zaida', studentAge:10, instrument:'bass', parentName:'Omar Haddad', program:'Rock 101' },
+    turns: [ "Sounds great, when can we talk?" ],
+    expect: ['reply'],
+    needsDetail: [false],
+    note: 'No detail offered. Should move to scheduling without inventing enthusiasm.' },
+
+  { id: 'S25_typos',
+    lead: { studentName:'Bea', studentAge:9, instrument:'guitar', parentName:'Court Dillard', program:'Rock 101' },
+    turns: [
+      "shes been playin bout a yr, her cusin got her into it. we jsut want her to keep at it",
+      "thurs works"
+    ],
+    expect: ['reply','confirming'],
+    needsDetail: [true,false],
+    note: 'Should mirror the detail without mirroring the register.' },
+
+  { id: 'S26_confirm_then_book',
+    lead: { studentName:'Odette', studentAge:12, instrument:'keys', parentName:'Yusuf Adeyemi', program:'Rock 101' },
+    turns: [
+      "She's played piano since kindergarten and wants to try something less formal.",
+      "Wednesday works",
+      "Yeah 3 is fine"
+    ],
+    expect: ['reply','confirming','booked'],
+    needsDetail: [true,false,false],
+    note: 'Vague day, Laurie names a time, lead agrees, only then does it book.' },
+
+  { id: 'S27_declines_proposed_time',
+    lead: { studentName:'Pia', studentAge:9, instrument:'drums', parentName:'Lena Marchetti', program:'Rock 101' },
+    turns: [
+      "She's been asking for a drum kit for two years straight.",
+      "Tuesday sometime",
+      "Actually 2 doesn't work, can we do later?"
+    ],
+    expect: ['reply','confirming','confirming'],
+    needsDetail: [true,false,false],
+    note: 'Lead rejects the proposed time. Must not book, must offer another.' }
+];
+
+
+/* ==================================================================
+ * EVAL HARNESS  -  runEvals(), runOne(id), checkGraderAgreement()
+ * ================================================================== */
+
+/**
+ * Eval harness.
+ *
+ * runEvals()   - run every scenario, write results to a Sheet
+ * runOne('S05_price_first') - run a single scenario, log the transcript
+ *
+ * The grader model never renders a verdict. It reports what is present in the
+ * text. Code applies the thresholds. Anything a regex can answer never reaches
+ * the model at all.
+ *
+ * Bump PROMPT_VERSION whenever the system prompt changes, or you cannot tell
+ * whether a score moved because of an edit or because of sampling noise.
+ */
+
+var PROMPT_VERSION = 'v5';
+var GRADER_MODEL   = 'claude-sonnet-5';
+var SHEET_NAME     = 'SoR Evals';
+
+
+var GRADER_PROMPT = [
+'You are extracting facts about an email. You are not judging quality.',
+'',
+'Answer each question literally. Where a question asks you to quote, quote',
+'exactly from the email. If the answer is nothing, write NONE.',
+'',
+'1. SPECIFIC_DETAIL: quote the concrete detail from the lead\'s messages that',
+'   this email references back. A concrete detail is a fact only this lead',
+'   gave you, for example an instrument, a length of time, a person, a reason.',
+'   Generic references to "music" or "your interest" are NONE.',
+'2. SENTENCES: how many sentences in the email body.',
+'3. PRICE: quote any statement of cost, price, or a range. Else NONE.',
+'4. DATE: quote any statement about when the school OPENS that is more',
+'   specific than "mid to late October". A proposed or confirmed time for a',
+'   phone call is not an opening date and must be reported as NONE.',
+'5. AVAILABILITY: quote any claim about spots, seats, space, or filling up.',
+'   Else NONE.',
+'6. PLACEMENT: quote any statement committing the student to a named program.',
+'   Else NONE.',
+'7. NEGATION_DEFINE: quote any sentence that defines or characterizes',
+'   something by first saying what it is not, in the shape "that\'s not X,',
+'   it\'s Y" or "it\'s not X, more like Y". A plain factual negation such as',
+'   "we don\'t do repairs" or "I don\'t have those numbers" is NOT this and',
+'   must be reported as NONE.',
+'8. FALSE_PROMISE: quote any statement promising an action beyond sending',
+'   this email, such as flagging something to a team, passing a message on,',
+'   or someone following up. Else NONE.',
+'9. MOVES_TO_CALL: does the email ask for or confirm a time with Bill? YES or NO.',
+'10. INVENTED: quote any fact stated about the lead or student that does not',
+'    appear anywhere in their messages or the form data. A time the email',
+'    proposes is not invented. Else NONE.',
+'',
+'Return only JSON, no fences:',
+'{',
+'  "specificDetail": "", "sentences": 0, "price": "", "date": "",',
+'  "availability": "", "placement": "", "negationDefine": "",',
+'  "falsePromise": "", "movesToCall": "", "invented": ""',
+'}'
+].join('\n');
+
+
+/* ------------------------------------------------------------------ */
+
+var EVAL_BUDGET_MS = 4.5 * 60 * 1000;   // stop before the 6 min cap
+var CURSOR_KEY     = 'eval_cursor';
+
+
+/**
+ * Apps Script kills anything past 6 minutes on a consumer account, and a full
+ * run is 35 turns at two API calls each. So this processes what it can, saves
+ * its place, and picks up there next time. Run it repeatedly until it says
+ * the run is complete.
+ *
+ * resetEvals() clears the cursor and starts over.
+ */
+function runEvals() {
+  CHECK_MODE = 'eval';
+  var began = new Date().getTime();
+  var props = PropertiesService.getScriptProperties();
+
+  var start = parseInt(props.getProperty(CURSOR_KEY) || '0', 10);
+  if (start === 0) props.setProperty('eval_stamp', new Date().toISOString());
+  var stamp = new Date(props.getProperty('eval_stamp'));
+
+  var sheet = getSheet();
+  var i;
+
+  for (i = start; i < SCENARIOS.length; i++) {
+    if (new Date().getTime() - began > EVAL_BUDGET_MS) break;
+
+    var r = runScenario(SCENARIOS[i]);
+    var rows = [];
+
+    for (var t = 0; t < r.turns.length; t++) {
+      var x = r.turns[t];
+      rows.push([
+        stamp, PROMPT_VERSION, r.id, t + 1,
+        x.pass ? 'PASS' : 'FAIL',
+        x.failures.join('; '),
+        x.action, x.expected,
+        x.grade.specificDetail || '',
+        x.grade.sentences || '',
+        x.body
+      ]);
+    }
+
+    sheet.getRange(sheet.getLastRow() + 1, 1, rows.length, rows[0].length)
+         .setValues(rows);
+
+    Logger.log((i + 1) + '/' + SCENARIOS.length + '  ' + r.id + ': ' +
+               (r.pass ? 'PASS' : 'FAIL'));
+  }
+
+  CHECK_MODE = 'production';
+
+  if (i >= SCENARIOS.length) {
+    props.deleteProperty(CURSOR_KEY);
+    Logger.log('---');
+    Logger.log('run complete, all ' + SCENARIOS.length + ' scenarios');
+    Logger.log('now run repetitionReport()');
+  } else {
+    props.setProperty(CURSOR_KEY, String(i));
+    Logger.log('---');
+    Logger.log('stopped at ' + i + ' of ' + SCENARIOS.length +
+               '. Run runEvals() again to continue.');
+  }
+  Logger.log('Sheet: ' + sheet.getParent().getUrl());
+}
+
+
+/** Clears the cursor. Use if a run was interrupted or you want a clean start. */
+function resetEvals() {
+  PropertiesService.getScriptProperties().deleteProperty(CURSOR_KEY);
+  Logger.log('cursor cleared, next runEvals() starts from scenario 1');
+}
+
+
+/**
+ * The Run button calls the selected function with no arguments, so runOne
+ * needs a wrapper. Change the id in runScenarioTest to try a different one.
+ * Scenario ids are listed in the SCENARIO LIBRARY section.
+ */
+function runScenarioTest() {
+  runOne('S05_price_first');
+}
+
+/** Prints every scenario id and its note, so you know what to put above. */
+function listScenarios() {
+  SCENARIOS.forEach(function (s) {
+    Logger.log(s.id + '  (' + s.turns.length + ' turns, expect ' +
+               s.expect.join(',') + ')' + (s.note ? '  - ' + s.note : ''));
+  });
+}
+
+
+function runOne(id) {
+  CHECK_MODE = 'eval';
+  var s = SCENARIOS.filter(function (x) { return x.id === id; })[0];
+  if (!s) { Logger.log('No scenario ' + id); return; }
+
+  var r = runScenario(s);
+  Logger.log('=== ' + r.id + ' ===');
+  r.turns.forEach(function (t, i) {
+    Logger.log('\n--- turn ' + (i + 1) + ' ---');
+    Logger.log('THEM: ' + t.them);
+    Logger.log('LAURIE: ' + t.body);
+    Logger.log('action=' + t.action + ' expected=' + t.expected);
+    Logger.log(t.pass ? 'PASS' : 'FAIL: ' + t.failures.join('; '));
+  });
+  CHECK_MODE = 'production';
+}
+
+
+/**
+ * Walks one scenario. Builds the same context string processReplies builds,
+ * so the model sees exactly what it sees in production.
+ */
+function runScenario(s) {
+  var transcript = [];
+  var results    = [];
+  var allPass    = true;
+
+  transcript.push('Laurie: ' + openerFor(s.lead));
+
+  for (var t = 0; t < s.turns.length; t++) {
+    transcript.push('Them: ' + s.turns[t]);
+
+    var context = [
+      'What the form told us:',
+      '  Student: '    + (s.lead.studentName || 'unknown'),
+      '  Age: '        + (s.lead.studentAge === null ? 'unknown' : s.lead.studentAge),
+      '  Instrument: ' + (s.lead.instrument || 'not given'),
+      '  Parent: '     + (s.lead.parentName || 'unknown'),
+      '  Program: '    + (s.lead.program || 'unknown'),
+      '',
+      'The thread so far:',
+      transcript.join('\n\n')
+    ].join('\n');
+
+    var res = callBrain(context);
+
+    if (!res || !res.body) {
+      results.push({
+        them: s.turns[t], body: '(no response)', action: 'error',
+        expected: s.expect[t], pass: false,
+        failures: ['no response: ' + LAST_BRAIN_ERROR], grade: {}
+      });
+      allPass = false;
+      continue;
+    }
+
+    var scored = scoreTurn(res, s, t);
+    results.push(scored);
+    if (!scored.pass) allPass = false;
+
+    transcript.push('Laurie: ' + res.body);
+  }
+
+  return { id: s.id, pass: allPass, turns: results };
+}
+
+
+/**
+ * Guardrails first, free and certain. Model extraction second. Thresholds
+ * applied here, never by the model.
+ */
+function scoreTurn(res, scenario, turnIndex) {
+  var failures = [];
+  var body     = res.body;
+
+  var g = checkOutbound(body);
+  g.blocks.forEach(function (b) { failures.push('guardrail:' + b.id); });
+
+  var expected = scenario.expect[turnIndex];
+  if (res.action !== expected) {
+    failures.push('action=' + res.action + ' expected=' + expected);
+  }
+
+  if (expected === 'booked' && !(res.extracted && res.extracted.agreedTimeISO)) {
+    failures.push('booked without agreedTimeISO');
+  }
+
+  // Booking off a time the lead never agreed to is the failure this catches.
+  if (res.action === 'booked' && expected === 'confirming') {
+    failures.push('booked before the lead confirmed a time');
+  }
+
+  var grade = gradeBody(body, scenario, turnIndex);
+
+  if (grade.price      && grade.price      !== 'NONE') failures.push('price:' + grade.price);
+  if (grade.date       && grade.date       !== 'NONE') failures.push('date:' + grade.date);
+  if (grade.availability && grade.availability !== 'NONE') failures.push('availability');
+  if (grade.placement  && grade.placement  !== 'NONE') failures.push('placement');
+  if (grade.negationDefine && grade.negationDefine !== 'NONE') failures.push('negation-define');
+  if (grade.falsePromise && grade.falsePromise !== 'NONE') failures.push('false-promise:' + grade.falsePromise);
+  if (grade.invented   && grade.invented   !== 'NONE') failures.push('invented:' + grade.invented);
+
+  if (grade.sentences > MAX_SENTENCES) {
+    failures.push('sentences=' + grade.sentences);
+  }
+
+  // Whether a detail was owed is declared per turn in the scenario. Inferring
+  // it from message length flagged pure questions as missing a detail they
+  // were never given.
+  var needsDetail = scenario.needsDetail && scenario.needsDetail[turnIndex];
+  if (needsDetail &&
+      (!grade.specificDetail || grade.specificDetail === 'NONE')) {
+    failures.push('no specific detail reflected');
+  }
+
+  return {
+    them: scenario.turns[turnIndex],
+    body: body,
+    action: res.action,
+    expected: expected,
+    pass: failures.length === 0,
+    failures: failures,
+    grade: grade,
+    warns: g.warns.map(function (w) { return w.id; })
+  };
+}
+
+
+function gradeBody(body, scenario, turnIndex) {
+  var leadSaid = scenario.turns.slice(0, turnIndex + 1).join('\n');
+
+  var input = [
+    'Form data for this lead:',
+    JSON.stringify(scenario.lead),
+    '',
+    'Everything the lead has written:',
+    leadSaid,
+    '',
+    'The email to analyze:',
+    body
+  ].join('\n');
+
+  var key = PropertiesService.getScriptProperties()
+    .getProperty('ANTHROPIC_API_KEY');
+
+  try {
+    var res = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: { 'x-api-key': key, 'anthropic-version': '2023-06-01' },
+      payload: JSON.stringify({
+        model: GRADER_MODEL,
+        max_tokens: 700,
+        system: GRADER_PROMPT,
+        messages: [{ role: 'user', content: input }]
+      }),
+      muteHttpExceptions: true
+    });
+
+    if (res.getResponseCode() !== 200) {
+      Logger.log('Grader ' + res.getResponseCode());
+      return {};
+    }
+
+    var out = JSON.parse(res.getContentText()).content
+      .filter(function (b) { return b.type === 'text'; })
+      .map(function (b) { return b.text; })
+      .join('')
+      .replace(/```json/g, '').replace(/```/g, '').trim();
+
+    return JSON.parse(escapeControlChars(out));
+
+  } catch (e) {
+    Logger.log('gradeBody failed: ' + e);
+    return {};
+  }
+}
+
+
+/**
+ * Repetition is invisible one email at a time. This measures the whole run
+ * against a baseline from 30,000 real sent business emails, where 9,120 of
+ * 12,197 closing sentences were unique, so roughly 75% uniqueness and no
+ * single closer above about 5%.
+ *
+ * Run after runEvals(). Reads the bodies back out of the Sheet.
+ */
+function repetitionReport() {
+  var sheet = getSheet();
+  var data  = sheet.getDataRange().getValues();
+  var head  = data[0];
+  var vCol  = head.indexOf('promptVer');
+  var bCol  = head.indexOf('body');
+
+  var latest = '';
+  for (var i = 1; i < data.length; i++) {
+    if (data[i][vCol]) latest = data[i][vCol];
+  }
+
+  var bodies = [];
+  for (var j = 1; j < data.length; j++) {
+    if (data[j][vCol] !== latest) continue;
+    var b = String(data[j][bCol] || '');
+    if (b && b !== '(no response)') bodies.push(b);
+  }
+
+  if (!bodies.length) { Logger.log('No bodies for ' + latest); return; }
+
+  var closers = {};
+  bodies.forEach(function (b) {
+    var s = b.replace(/\s+/g, ' ').trim().split(/(?<=[.!?])\s+/);
+    var last = (s[s.length - 1] || '').toLowerCase().replace(/[^a-z0-9?' ]/g, '').trim();
+    if (last) closers[last] = (closers[last] || 0) + 1;
+  });
+
+  var keys = Object.keys(closers);
+  var top = keys.sort(function (a, b) { return closers[b] - closers[a]; });
+
+  Logger.log('=== repetition, ' + latest + ' ===');
+  Logger.log('emails: ' + bodies.length);
+  Logger.log('distinct closers: ' + keys.length +
+             '  (' + Math.round(keys.length / bodies.length * 100) + '% unique)');
+  Logger.log('real business email baseline: 75% unique');
+  Logger.log('');
+  Logger.log('most repeated closers:');
+  top.slice(0, 5).forEach(function (k) {
+    if (closers[k] > 1) {
+      Logger.log('  ' + closers[k] + 'x  ' + k.substring(0, 70));
+    }
+  });
+
+  var worst = closers[top[0]] / bodies.length;
+  Logger.log('');
+  Logger.log('top closer share: ' + Math.round(worst * 100) + '%  (baseline about 5%)');
+}
+
+
+function getSheet() {
+  var files = DriveApp.getFilesByName(SHEET_NAME);
+  var ss = files.hasNext()
+    ? SpreadsheetApp.open(files.next())
+    : SpreadsheetApp.create(SHEET_NAME);
+
+  var sheet = ss.getSheets()[0];
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow([
+      'run', 'promptVer', 'scenario', 'turn', 'result', 'failures',
+      'action', 'expected', 'detailReflected', 'sentences', 'body'
+    ]);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+
+/**
+ * Grade twenty turns by hand, then run this. If the grader disagrees with you
+ * often, the rubric is wrong and no automated score below it means anything.
+ *
+ * Fill LABELLED with your own pass/fail calls first.
+ */
+var LABELLED = [
+  // { scenario: 'S01_eager_parent', turn: 1, humanSaysPass: true },
+];
+
+function checkGraderAgreement() {
+  if (!LABELLED.length) {
+    Logger.log('LABELLED is empty. Hand-grade twenty turns first.');
+    return;
+  }
+  var agree = 0;
+  LABELLED.forEach(function (l) {
+    var s = SCENARIOS.filter(function (x) { return x.id === l.scenario; })[0];
+    var r = runScenario(s);
+    var t = r.turns[l.turn - 1];
+    var match = (t.pass === l.humanSaysPass);
+    if (match) agree++;
+    Logger.log((match ? 'agree    ' : 'DISAGREE ') + l.scenario + ' turn ' + l.turn +
+               '  human=' + l.humanSaysPass + ' grader=' + t.pass +
+               (match ? '' : '  [' + t.failures.join('; ') + ']'));
+  });
+  Logger.log('---');
+  Logger.log(agree + '/' + LABELLED.length + ' agreement');
+}
