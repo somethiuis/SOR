@@ -1,0 +1,626 @@
+/**
+ * School of Rock Springfield - Email conversation agent
+ *
+ * Email 1 is parsed and templated with no AI at all. Everything the opener
+ * needs is already in the HubSpot notification, so there is nothing for a
+ * model to add except drift.
+ *
+ * The model only writes from email 2 onward, where it has to react to
+ * something a real person typed.
+ *
+ * SETUP (once):
+ *   1. Project Settings > Script Properties:
+ *        ANTHROPIC_API_KEY = sk-ant-...
+ *   2. Run setupLabels()
+ *   3. Gmail filter: subject contains "New Lead - Contact" -> apply NewLead
+ *   4. Trigger run() every minute
+ */
+
+var MODEL     = 'claude-sonnet-4-6';
+var MAX_TURNS = 8;
+
+var CALENDAR_ID  = 'primary';   // swap for the school calendar
+var CALL_MINUTES = 15;
+var TIMEZONE     = 'America/New_York';
+
+var SCHOOL_DOMAIN = 'schoolofrock.com';
+var ADULT_AGE     = 18;
+var LITTLE_AGE    = 6;          // below this, "getting into it" reads wrong
+
+var L_NEW     = 'NewLead';
+var L_DONE    = 'Processed';
+var L_THREAD  = 'SoRLead';
+var L_BOOKED  = 'SoRBooked';
+var L_HANDOFF = 'SoRHandoff';
+var L_ERROR   = 'SoRError';
+
+
+var SIGNATURE = [
+  '',
+  'Best,',
+  'Laurie',
+  'School of Rock Springfield, VA',
+  '(703) 755-7276'
+].join('\n');
+
+var LEGAL = [
+  '',
+  '',
+  'This email and any files transmitted with it are confidential and intended ' +
+  'solely for the use of the individual or entity to whom they are addressed. ' +
+  'If you have received this email in error please notify the system manager. ' +
+  'This message contains confidential information and is intended only for the ' +
+  'individual named. If you are not the named addressee you should not ' +
+  'disseminate, distribute or copy this e-mail. Please notify the sender ' +
+  'immediately by e-mail if you have received this e-mail by mistake and delete ' +
+  'this e-mail from your system. If you are not the intended recipient you are ' +
+  'notified that disclosing, copying, distributing or taking any action in ' +
+  'reliance on the contents of this information is strictly prohibited.'
+].join('\n');
+
+
+/* ------------------------------------------------------------------ *
+ * SYSTEM PROMPT - only used from email 2 onward
+ * ------------------------------------------------------------------ */
+
+var SYSTEM_PROMPT = [
+'You are Laurie, front office at School of Rock Springfield. You are partway',
+'through an email thread with someone who filled out the pre-enrollment form.',
+'The opener already went out. Your job is what comes after.',
+'',
+'## The goal',
+'',
+'Get a call booked with Bill, the owner. You are not doing intake and you are',
+'not selling. Bill handles all of that.',
+'',
+'## What you know',
+'',
+'- School of Rock Springfield, not open yet, pre-enrollment.',
+'- Opening is mid to late October and that date can move. Never be more precise',
+'  than that, and always note it might shift.',
+'- Bill Schroeher owns the school and takes these calls himself. Always just',
+'  "Bill".',
+'- Camps are running at nearby facilities while the building is finished. Never',
+'  name a camp, a date, or say whether there is space. Bill has the real list.',
+'- Instruments: guitar, bass, drums, keys, vocals. No experience needed.',
+'',
+'## Second email',
+'',
+'They just told you something about themselves or their kid. Three jobs, in',
+'this order:',
+'',
+'1. Repeat back one specific thing they said. Not a summary, one concrete',
+'   detail. If they said their daughter has been banging on pots since she was',
+'   two, say the pots.',
+'2. Say you think the school would be a good fit, and tie it to that detail.',
+'3. Move to the call. Bill has the current camp and pre-enrollment info and can',
+'   speak to which program actually fits.',
+'',
+'Then ask if there is a time that works for them in the coming days.',
+'',
+'## About excitement',
+'',
+'Do not perform enthusiasm. No "that\'s fantastic", no "how exciting", no',
+'"I love that". Naming the specific thing they told you already shows you read',
+'it. That is the whole trick. An adjective in front of it makes it worse, not',
+'warmer.',
+'',
+'## Hard rules',
+'',
+'- Never give a price. No number, no range, no "around".',
+'- Never give an opening date more precise than mid to late October.',
+'- Never name specific camps, dates, or availability.',
+'- Never say definitively which program someone belongs in. Bill decides.',
+'- Never take payment or card details.',
+'- Only answer from what is above. Everything else is for the call.',
+'- If they are upset, ask for a person, raise billing, or ask something not',
+'  covered here, hand off.',
+'',
+'## How to write',
+'',
+'Short. Four sentences is usually plenty.',
+'',
+'Rules of voice:',
+'- No em dashes. Use a period or a comma.',
+'- Contractions.',
+'- Do not open with an acknowledgment token. No "Got it", no "Perfect", no',
+'  "Thanks for sharing that". Start with the actual content.',
+'- No colon setups. Not "Quick question:" or "One thing:". Just say it.',
+'- No bullet points, no headers.',
+'- One exclamation point per email at most, and only if it earns it.',
+'- Do not explain why you are saying something. Say it.',
+'- Do not preempt objections nobody raised.',
+'- Vary sentence length.',
+'- Do not sign off. The signature is added automatically. Never write "Best",',
+'  "Laurie", or a phone number.',
+'',
+'## Booking',
+'',
+'Ask if a time in the coming days works. When they name one, confirm it in a',
+'single line and stop.',
+'',
+'Set action to "booked" when they agree to a time, and return agreedTimeISO in',
+'ISO 8601 with no timezone suffix, for example 2026-08-11T16:00:00. Times are',
+'Eastern. If they say something vague like "Tuesday afternoon", pick 2pm and',
+'put the exact time in your confirmation so they can correct it.',
+'',
+'## Output',
+'',
+'Return only JSON. No markdown fences, no preamble.',
+'',
+'{',
+'  "action": "reply" | "booked" | "handoff",',
+'  "body": "...",',
+'  "extracted": {',
+'    "studentName": "", "studentAge": null, "instrument": "",',
+'    "program": "", "agreedTime": "", "agreedTimeISO": "",',
+'    "notesForBill": ""',
+'  }',
+'}',
+'',
+'Program mapping, internal only, never say it to them:',
+'4-5 Little Wing / 6-7 Rookies / 8-13 Rock 101 / 14+ or already plays',
+'Performance Program / adult Adult Program.',
+'',
+'"notesForBill" is what gives Bill context before he dials. What the kid plays,',
+'how long, who got them into it, why now. One or two plain sentences. This is',
+'the thing that keeps the call from starting cold.'
+].join('\n');
+
+
+/* ------------------------------------------------------------------ *
+ * MAIN
+ * ------------------------------------------------------------------ */
+
+function run() {
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) return;
+  try {
+    processNewLeads();
+    processReplies();
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+
+/* ------------------------------------------------------------------ *
+ * EMAIL 1 - no AI
+ * ------------------------------------------------------------------ */
+
+function processNewLeads() {
+  var threads = GmailApp.search('label:' + L_NEW + ' -label:' + L_DONE, 0, 10);
+  Logger.log('New leads: ' + threads.length);
+
+  for (var i = 0; i < threads.length; i++) {
+    var msg  = newestMessage(threads[i]);
+    var lead = parseHubSpot(msg.getPlainBody());
+
+    if (!lead.email || !lead.parentName) {
+      Logger.log('Could not parse lead, flagging for a human. ' +
+                 JSON.stringify(lead));
+      threads[i].addLabel(getLabel(L_ERROR));
+      threads[i].addLabel(getLabel(L_DONE));
+      continue;
+    }
+
+    var subject = 'School of Rock Springfield';
+    var body    = openerFor(lead) + SIGNATURE + LEGAL;
+
+    GmailApp.sendEmail(lead.email, subject, body);
+    Logger.log('Opener sent to ' + lead.email + ' re ' + lead.studentName);
+
+    var sent = tagSentThread(lead.email, subject);
+    if (sent) saveLead(sent.getId(), lead);
+
+    threads[i].addLabel(getLabel(L_DONE));
+  }
+}
+
+
+/**
+ * Everything the opener needs is a labelled field in the notification, so
+ * this is a regex job. No model, no drift, no cost.
+ */
+function parseHubSpot(body) {
+  // [ \t] rather than \s, or a blank field swallows the line below it.
+  function grab(label) {
+    var re = new RegExp(label + '[ \\t]*:[ \\t]*([^\\r\\n]*)', 'i');
+    var m  = body.match(re);
+    return m ? m[1].trim() : '';
+  }
+
+  var emails = body.match(/[\w.+-]+@[\w.-]+\.\w+/g) || [];
+  var lead = emails.filter(function (e) {
+    return e.toLowerCase().indexOf(SCHOOL_DOMAIN) === -1 &&
+           e.toLowerCase().indexOf('hubspot') === -1;
+  });
+
+  var ageRaw = grab('Student Age');
+  var ageNum = parseInt(ageRaw, 10);
+
+  return {
+    studentName: grab('Student Name'),
+    studentAge:  isNaN(ageNum) ? null : ageNum,
+    instrument:  grab('Instrument').toLowerCase(),
+    parentName:  grab('Parent\\/Guardian'),
+    email:       lead.length ? lead[0] : '',
+    phone:       grab('Tel'),
+    program:     programFor(isNaN(ageNum) ? null : ageNum)
+  };
+}
+
+
+function programFor(age) {
+  if (age === null)     return 'unknown';
+  if (age >= ADULT_AGE) return 'Adult Program';
+  if (age >= 14)        return 'Performance Program';
+  if (age >= 8)         return 'Rock 101';
+  if (age >= 6)         return 'Rookies';
+  if (age >= 4)         return 'Little Wing';
+  return 'unknown';
+}
+
+
+/**
+ * Five branches. Adult with and without an instrument, child with and
+ * without, and a softer one for the very young where "getting into it"
+ * would be a stretch.
+ */
+function openerFor(lead) {
+  var hi   = 'Hi ' + firstNameOf(lead.parentName) + '!';
+  var seen = 'Just saw you filled out our form to learn more about ' +
+             'School of Rock Springfield.';
+
+  var kid  = lead.studentAge !== null && lead.studentAge < ADULT_AGE;
+  var inst = lead.instrument && lead.instrument.length > 1;
+  var name = lead.studentName || 'them';
+  var ask;
+
+  if (!kid) {
+    ask = inst
+      ? 'Tell me a bit about your experience with the ' + lead.instrument +
+        ' and what has you interested in us!'
+      : 'Tell me a bit about what has you interested in us!';
+
+  } else if (lead.studentAge !== null && lead.studentAge < LITTLE_AGE) {
+    ask = inst
+      ? 'Could you tell me a bit about how ' + name + ' got interested in the ' +
+        lead.instrument + ', and what you are hoping they get out of it?'
+      : 'Could you tell me a bit about what you are hoping ' + name +
+        ' gets out of it?';
+
+  } else {
+    ask = inst
+      ? 'It\'s great to hear that ' + name + ' is getting into the ' +
+        lead.instrument + ', could you tell me a bit about ' + name +
+        '\'s experience and what brings you guys to us!'
+      : 'It\'s fantastic that ' + name + ' is into music! Could you tell me a ' +
+        'bit about what has you interested in us?';
+  }
+
+  return [hi, '', seen, '', ask].join('\n');
+}
+
+
+function firstNameOf(full) {
+  return (full || '').trim().split(/\s+/)[0] || 'there';
+}
+
+
+/* ------------------------------------------------------------------ *
+ * EMAIL 2+ - model writes
+ * ------------------------------------------------------------------ */
+
+function processReplies() {
+  var q = 'label:' + L_THREAD +
+          ' -label:' + L_BOOKED +
+          ' -label:' + L_HANDOFF +
+          ' -label:' + L_ERROR;
+
+  var threads = GmailApp.search(q, 0, 20);
+  var me = Session.getActiveUser().getEmail().toLowerCase();
+  Logger.log('Active threads: ' + threads.length);
+
+  for (var i = 0; i < threads.length; i++) {
+    var messages = threads[i].getMessages();
+    var last = messages[messages.length - 1];
+
+    if (last.getFrom().toLowerCase().indexOf(me) !== -1) continue;
+
+    if (messages.length > MAX_TURNS) {
+      Logger.log('Hit turn limit, handing off');
+      threads[i].addLabel(getLabel(L_HANDOFF));
+      continue;
+    }
+
+    var lead = loadLead(threads[i].getId()) || {};
+
+    var transcript = messages.map(function (m) {
+      var who = m.getFrom().toLowerCase().indexOf(me) !== -1 ? 'Laurie' : 'Them';
+      return who + ': ' + stripSignature(stripQuoted(m.getPlainBody()));
+    }).join('\n\n');
+
+    var context = [
+      'What the form told us:',
+      '  Student: '    + (lead.studentName || 'unknown'),
+      '  Age: '        + (lead.studentAge === null || lead.studentAge === undefined
+                          ? 'unknown' : lead.studentAge),
+      '  Instrument: ' + (lead.instrument || 'not given'),
+      '  Parent: '     + (lead.parentName || 'unknown'),
+      '  Program: '    + (lead.program || 'unknown'),
+      '',
+      'The thread so far:',
+      transcript
+    ].join('\n');
+
+    var res = callBrain(context);
+
+    if (!res || !res.body) {
+      Logger.log('Bad model response, flagging');
+      threads[i].addLabel(getLabel(L_ERROR));
+      continue;
+    }
+
+    threads[i].reply(res.body + SIGNATURE);
+
+    if (res.action === 'booked') {
+      bookCall(res, threads[i]);
+      threads[i].addLabel(getLabel(L_BOOKED));
+    }
+    if (res.action === 'handoff') {
+      threads[i].addLabel(getLabel(L_HANDOFF));
+    }
+
+    Logger.log('Replied, action=' + res.action);
+  }
+}
+
+
+function callBrain(userText) {
+  var key = PropertiesService.getScriptProperties()
+    .getProperty('ANTHROPIC_API_KEY');
+
+  if (!key) {
+    Logger.log('Missing ANTHROPIC_API_KEY in Script Properties');
+    return null;
+  }
+
+  try {
+    var res = UrlFetchApp.fetch('https://api.anthropic.com/v1/messages', {
+      method: 'post',
+      contentType: 'application/json',
+      headers: {
+        'x-api-key': key,
+        'anthropic-version': '2023-06-01'
+      },
+      payload: JSON.stringify({
+        model: MODEL,
+        max_tokens: 1000,
+        system: SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: todayLine() + userText }]
+      }),
+      muteHttpExceptions: true
+    });
+
+    var code = res.getResponseCode();
+    var txt  = res.getContentText();
+
+    if (code < 200 || code >= 300) {
+      Logger.log('Anthropic ' + code + ': ' + txt);
+      return null;
+    }
+
+    var out = JSON.parse(txt).content
+      .filter(function (b) { return b.type === 'text'; })
+      .map(function (b) { return b.text; })
+      .join('')
+      .replace(/```json/g, '')
+      .replace(/```/g, '')
+      .trim();
+
+    Logger.log('Brain: ' + out);
+    return JSON.parse(escapeControlChars(out));
+
+  } catch (e) {
+    Logger.log('callBrain failed: ' + e);
+    return null;
+  }
+}
+
+
+/* ------------------------------------------------------------------ *
+ * CALENDAR
+ * ------------------------------------------------------------------ */
+
+function bookCall(res, thread) {
+  var e   = res.extracted || {};
+  var iso = e.agreedTimeISO;
+
+  if (!iso) {
+    Logger.log('Booked but no agreedTimeISO, no event created');
+    return false;
+  }
+
+  var start = new Date(iso);
+  if (isNaN(start.getTime())) {
+    Logger.log('Unparseable time: ' + iso);
+    return false;
+  }
+
+  try {
+    var end  = new Date(start.getTime() + CALL_MINUTES * 60 * 1000);
+    var lead = loadLead(thread.getId()) || {};
+    var who  = e.studentName || lead.studentName || 'lead';
+
+    var desc = [
+      'Parent: '     + (lead.parentName || 'unknown'),
+      'Phone: '      + (lead.phone || 'unknown'),
+      'Email: '      + (lead.email || 'unknown'),
+      '',
+      'Student: '    + who,
+      'Age: '        + (e.studentAge || lead.studentAge || 'unknown'),
+      'Instrument: ' + (e.instrument || lead.instrument || 'not given'),
+      'Program: '    + (e.program || lead.program || 'unknown'),
+      '',
+      'Notes: '      + (e.notesForBill || 'none'),
+      '',
+      'Thread: '     + thread.getPermalink()
+    ].join('\n');
+
+    CalendarApp.getCalendarById(CALENDAR_ID)
+      .createEvent('SoR call: ' + who, start, end, { description: desc });
+
+    Logger.log('Booked ' + iso + ' for ' + who);
+    return true;
+
+  } catch (err) {
+    Logger.log('Calendar failed: ' + err);
+    return false;
+  }
+}
+
+
+/* ------------------------------------------------------------------ *
+ * HELPERS
+ * ------------------------------------------------------------------ */
+
+function saveLead(threadId, lead) {
+  try {
+    PropertiesService.getScriptProperties()
+      .setProperty('lead_' + threadId, JSON.stringify(lead));
+  } catch (e) {
+    Logger.log('saveLead failed: ' + e);
+  }
+}
+
+function loadLead(threadId) {
+  try {
+    var raw = PropertiesService.getScriptProperties()
+      .getProperty('lead_' + threadId);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+
+function todayLine() {
+  return 'Today is ' +
+    Utilities.formatDate(new Date(), TIMEZONE, 'EEEE, MMMM d, yyyy') + '.\n\n';
+}
+
+
+/**
+ * Models sometimes emit raw newlines inside JSON string values, which is
+ * invalid. Escape control chars only when inside a string so the structural
+ * formatting between properties survives.
+ */
+function escapeControlChars(s) {
+  var res = '';
+  var inStr = false;
+  var esc = false;
+
+  for (var i = 0; i < s.length; i++) {
+    var c = s[i];
+
+    if (esc) { res += c; esc = false; continue; }
+    if (c === '\\' && inStr) { res += c; esc = true; continue; }
+    if (c === '"') { inStr = !inStr; res += c; continue; }
+
+    if (inStr && c < ' ') {
+      if (c === '\n') res += '\\n';
+      else if (c === '\t') res += '\\t';
+      continue;
+    }
+
+    res += c;
+  }
+  return res;
+}
+
+
+function stripQuoted(body) {
+  return body.split('\n').filter(function (l) {
+    return l.indexOf('>') !== 0;
+  }).join('\n').trim();
+}
+
+
+/** Keeps the legal boilerplate out of the transcript we pay to send. */
+function stripSignature(body) {
+  var cut = body.indexOf('This email and any files transmitted');
+  if (cut !== -1) body = body.substring(0, cut);
+  cut = body.indexOf('School of Rock Springfield, VA');
+  if (cut !== -1) body = body.substring(0, cut);
+  return body.trim();
+}
+
+
+function tagSentThread(toEmail, subject) {
+  Utilities.sleep(3000);
+  var threads = GmailApp.search('in:sent to:' + toEmail, 0, 3);
+  for (var i = 0; i < threads.length; i++) {
+    if (threads[i].getFirstMessageSubject() === subject) {
+      threads[i].addLabel(getLabel(L_THREAD));
+      return threads[i];
+    }
+  }
+  Logger.log('Could not tag sent thread: ' + toEmail);
+  return null;
+}
+
+
+function newestMessage(thread) {
+  var m = thread.getMessages();
+  return m[m.length - 1];
+}
+
+function getLabel(name) {
+  return GmailApp.getUserLabelByName(name) || GmailApp.createLabel(name);
+}
+
+function setupLabels() {
+  [L_NEW, L_DONE, L_THREAD, L_BOOKED, L_HANDOFF, L_ERROR].forEach(getLabel);
+  Logger.log('Labels ready');
+}
+
+
+/* ------------------------------------------------------------------ *
+ * TESTING - run this to check the parser and all five openers without
+ * sending anything.
+ * ------------------------------------------------------------------ */
+
+function testOpeners() {
+  var sample =
+    'HubSpot Logo\n' +
+    'New Lead - Contact - Dan Fleming (VA - Springfield)\n' +
+    'You have a new task: New Lead - Contact - Dan Fleming (VA - Springfield)\n' +
+    'Student Name: Lilli\n' +
+    'Student Age: 4\n' +
+    'Instrument:  \n' +
+    'Parent/Guardian: Dan\n' +
+    'd.flemingvt@gmail.com\n' +
+    'Tel:+1 276-698-0143\n' +
+    '8/1/26\n' +
+    'Open in HubSpot\n' +
+    'Sent from an automated workflow\n' +
+    'This email was sent to springfieldva@schoolofrock.com because...\n';
+
+  var lead = parseHubSpot(sample);
+  Logger.log('PARSED: ' + JSON.stringify(lead));
+  Logger.log('--- opener ---\n' + openerFor(lead));
+
+  var cases = [
+    { studentName: 'Lilli',  studentAge: 4,  instrument: 'drums',  parentName: 'Dan Fleming' },
+    { studentName: 'Marcus', studentAge: 11, instrument: 'guitar', parentName: 'Renee Ortiz' },
+    { studentName: 'Marcus', studentAge: 11, instrument: '',       parentName: 'Renee Ortiz' },
+    { studentName: 'Tara',   studentAge: 34, instrument: 'bass',   parentName: 'Tara Nguyen' },
+    { studentName: 'Tara',   studentAge: 34, instrument: '',       parentName: 'Tara Nguyen' }
+  ];
+
+  cases.forEach(function (c) {
+    Logger.log('--- age ' + c.studentAge + ', inst "' + c.instrument + '" ---\n' +
+               openerFor(c));
+  });
+}
